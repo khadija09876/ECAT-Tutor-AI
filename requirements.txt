@@ -1,0 +1,8 @@
+streamlit>=1.40,<2
+groq>=0.13.0
+pypdf>=5.0.0
+faiss-cpu>=1.8.0
+sentence-transformers>=3.0.0
+transformers>=4.45.0
+torch>=2.2.0
+numpy>=1.26.0
