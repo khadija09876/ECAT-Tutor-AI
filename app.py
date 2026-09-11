@@ -1,22 +1,17 @@
-import io
 import os
-import re
 import json
-import math
-from typing import List, Dict, Any
+import re
+from typing import Any, Dict, List
 
+import faiss
 import numpy as np
 import streamlit as st
-import faiss
-from pypdf import PdfReader
 from groq import Groq
+from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
 
-# -----------------------------
-# Page configuration
-# -----------------------------
 st.set_page_config(
     page_title="ECAT-Tutor-AI",
     page_icon="🎓",
@@ -27,992 +22,719 @@ st.markdown(
     """
     <style>
     .main-title {
+        text-align: center;
         font-size: 42px;
         font-weight: 800;
-        margin-bottom: 0;
+        margin-bottom: 4px;
     }
     .subtitle {
-        font-size: 17px;
-        color: #667085;
-        margin-bottom: 25px;
+        text-align: center;
+        color: #777;
+        margin-bottom: 28px;
     }
-    .agent-box {
-        padding: 14px 18px;
-        border-radius: 12px;
-        border: 1px solid #e5e7eb;
-        background: #f8fafc;
-        margin-bottom: 10px;
-    }
-    .verified {
-        color: #087443;
-        font-weight: 700;
-    }
-    .warning {
-        color: #b54708;
-        font-weight: 700;
+    .result-card {
+        padding: 18px;
+        border-radius: 14px;
+        border: 1px solid rgba(128,128,128,.25);
+        margin-bottom: 12px;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# -----------------------------
-# Constants
-# -----------------------------
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-TOKENIZER_MODEL = "bert-base-uncased"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+st.markdown('<div class="main-title">🎓 ECAT-Tutor-AI</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="subtitle">Upload your ECAT book and let AI create summaries, notes, MCQs, and quizzes.</div>',
+    unsafe_allow_html=True,
+)
 
 
-# -----------------------------
-# Cached AI components
-# -----------------------------
-@st.cache_resource(show_spinner=False)
-def load_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL)
+@st.cache_resource
+def get_tokenizer():
+    return AutoTokenizer.from_pretrained("bert-base-uncased")
 
 
-@st.cache_resource(show_spinner=False)
-def load_tokenizer():
-    return AutoTokenizer.from_pretrained(TOKENIZER_MODEL)
+@st.cache_resource
+def get_embedding_model():
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 
-# -----------------------------
-# PDF processing
-# -----------------------------
-def extract_pdf_text(uploaded_file) -> str:
-    """Extract text from a PDF uploaded by the user."""
-    reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
-    pages = []
-
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        if text.strip():
-            pages.append(text)
-
-    return "\n\n".join(pages).strip()
+def get_groq_client():
+    api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is missing. Add it to Streamlit Secrets or as an environment variable."
+        )
+    return Groq(api_key=api_key)
 
 
 def normalize_text(text: str) -> str:
-    """Clean repeated whitespace while preserving readable paragraphs."""
     text = text.replace("\x00", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-# -----------------------------
-# Tokenization + chunking
-# -----------------------------
-def tokenize_text(text: str) -> List[int]:
-    """Tokenize source text using a Hugging Face tokenizer."""
-    tokenizer = load_tokenizer()
-    return tokenizer.encode(text, add_special_tokens=False)
+def extract_pdf_pages(uploaded_file) -> List[Dict[str, Any]]:
+    uploaded_file.seek(0)
+    reader = PdfReader(uploaded_file)
+    pages = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = normalize_text(page.extract_text() or "")
+        if text:
+            pages.append({"page": page_number, "text": text})
+
+    return pages
 
 
-def chunk_text(text: str, max_tokens: int = 300, overlap: int = 60) -> List[str]:
-    """
-    Split text into token-aware chunks.
-
-    Token-aware chunking keeps chunks within a predictable size for
-    embedding and retrieval while retaining overlap between neighboring chunks.
-    """
-    tokenizer = load_tokenizer()
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-
-    if not token_ids:
-        return []
-
+def create_chunks(
+    pages: List[Dict[str, Any]],
+    chunk_size: int = 500,
+    overlap: int = 80,
+) -> List[Dict[str, Any]]:
+    tokenizer = get_tokenizer()
     chunks = []
-    start = 0
 
-    while start < len(token_ids):
-        end = min(start + max_tokens, len(token_ids))
-        chunk_ids = token_ids[start:end]
-        chunk = tokenizer.decode(chunk_ids, skip_special_tokens=True).strip()
+    for page in pages:
+        token_ids = tokenizer.encode(
+            page["text"],
+            add_special_tokens=False,
+        )
 
-        if chunk:
-            chunks.append(chunk)
+        start = 0
 
-        if end >= len(token_ids):
-            break
+        while start < len(token_ids):
+            end = min(start + chunk_size, len(token_ids))
 
-        start = max(0, end - overlap)
+            chunk_text = tokenizer.decode(
+                token_ids[start:end],
+                skip_special_tokens=True,
+            ).strip()
+
+            if chunk_text:
+                chunks.append(
+                    {
+                        "text": chunk_text,
+                        "page": page["page"],
+                    }
+                )
+
+            if end >= len(token_ids):
+                break
+
+            start = max(end - overlap, start + 1)
 
     return chunks
 
 
-# -----------------------------
-# FAISS vector database
-# -----------------------------
-def build_faiss_index(chunks: List[str]):
-    """Create normalized sentence embeddings and store them in FAISS."""
-    embedder = load_embedding_model()
+def create_vector_index(chunks: List[Dict[str, Any]]):
+    model = get_embedding_model()
 
-    embeddings = embedder.encode(
-        chunks,
-        convert_to_numpy=True,
+    texts = [chunk["text"] for chunk in chunks]
+
+    embeddings = model.encode(
+        texts,
         normalize_embeddings=True,
         show_progress_bar=False,
     ).astype("float32")
 
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
 
-    return index, embeddings
+    return index
 
 
-def retrieve_context(
+def retrieve_relevant_chunks(
     query: str,
-    chunks: List[str],
+    chunks: List[Dict[str, Any]],
     index,
     top_k: int = 6,
-) -> List[Dict[str, Any]]:
-    """Retrieve the most relevant chunks from the FAISS index."""
-    embedder = load_embedding_model()
+):
+    model = get_embedding_model()
 
-    query_vector = embedder.encode(
+    query_embedding = model.encode(
         [query],
-        convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
     ).astype("float32")
 
-    k = min(top_k, len(chunks))
-    scores, indices = index.search(query_vector, k)
+    scores, ids = index.search(
+        query_embedding,
+        min(top_k, len(chunks)),
+    )
 
     results = []
 
-    for score, idx in zip(scores[0], indices[0]):
+    for score, idx in zip(scores[0], ids[0]):
         if idx >= 0:
             results.append(
                 {
-                    "chunk": chunks[int(idx)],
+                    "text": chunks[int(idx)]["text"],
+                    "page": chunks[int(idx)]["page"],
                     "score": float(score),
-                    "chunk_id": int(idx),
                 }
             )
 
     return results
 
 
-# -----------------------------
-# Groq client
-# -----------------------------
-def get_groq_client() -> Groq:
-    """Create a Groq client from Streamlit secrets or environment variables."""
-    api_key = None
+def extract_json(text: str):
+    text = text.strip()
+
+    text = re.sub(r"^```json", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^```", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
 
     try:
-        api_key = st.secrets.get("GROQ_API_KEY")
-    except Exception:
+        return json.loads(text)
+    except json.JSONDecodeError:
         pass
 
-    api_key = api_key or os.getenv("GROQ_API_KEY")
+    start = text.find("{")
+    end = text.rfind("}")
 
-    if not api_key:
-        raise ValueError(
-            "GROQ_API_KEY is missing. Add it to Streamlit Secrets or your environment."
-        )
+    if start != -1 and end > start:
+        return json.loads(text[start : end + 1])
 
-    return Groq(api_key=api_key)
+    raise ValueError("AI returned invalid JSON.")
 
 
-def groq_generate(
-    system_prompt: str,
-    user_prompt: str,
-    model: str = DEFAULT_GROQ_MODEL,
-    temperature: float = 0.2,
-) -> str:
-    """Call Groq Chat Completions and return the generated text."""
+def ask_groq(prompt: str):
     client = get_groq_client()
 
     response = client.chat.completions.create(
-        model=model,
+        model="llama-3.3-70b-versatile",
+        temperature=0.15,
+        response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {
+                "role": "system",
+                "content": (
+                    "You are ECAT-Tutor-AI. "
+                    "Create accurate educational material using only the supplied "
+                    "uploaded-book content. Do not invent source-specific facts."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
         ],
-        temperature=temperature,
-        max_completion_tokens=6000,
     )
 
-    return response.choices[0].message.content
+    return extract_json(response.choices[0].message.content)
 
 
-# -----------------------------
-# Agent A: Syllabus/RAG Architect
-# -----------------------------
-def architect_agent(
-    subject: str,
+def context_text(context: List[Dict[str, Any]]) -> str:
+    return "\n\n".join(
+        f"[Book Page {item['page']}] {item['text']}"
+        for item in context
+    )
+
+
+def generate_summary(context: List[Dict[str, Any]], topic: str):
+    prompt = f"""
+Create a concise ECAT study summary from the supplied book content.
+
+Requested topic:
+{topic or "Use the main concepts available in the uploaded book."}
+
+Return JSON:
+{{
+  "title": "string",
+  "summary": "clear exam-focused summary",
+  "key_points": ["important point 1", "important point 2"],
+  "formulas": ["formula 1", "formula 2"],
+  "quick_revision": ["revision point 1", "revision point 2"]
+}}
+
+Only use the supplied book content.
+
+BOOK CONTENT:
+{context_text(context)}
+"""
+    return ask_groq(prompt)
+
+
+def generate_notes(context: List[Dict[str, Any]], topic: str):
+    prompt = f"""
+Create detailed but easy-to-revise ECAT notes from the supplied book content.
+
+Requested topic:
+{topic or "Use the retrieved book material."}
+
+Return JSON:
+{{
+  "title": "string",
+  "concepts": ["concept with concise explanation"],
+  "definitions": ["important definition"],
+  "formulas": ["important formula and meaning"],
+  "important_points": ["exam-relevant point"],
+  "exam_tips": ["useful exam tip"]
+}}
+
+Use only the supplied book content.
+
+BOOK CONTENT:
+{context_text(context)}
+"""
+    return ask_groq(prompt)
+
+
+def generate_mcqs(
+    context: List[Dict[str, Any]],
     topic: str,
     difficulty: str,
-    number_of_questions: int,
-    retrieved_context: str,
-    model: str,
-) -> Dict[str, Any]:
-    """Create an exam blueprint using only retrieved PDF context."""
-    system_prompt = """
-You are Agent A, the ECAT Syllabus and Blueprint Architect.
+    count: int,
+):
+    prompt = f"""
+Create exactly {count} ECAT-style MCQs from the supplied book content.
 
-Your job is to design a high-quality ECAT mock-test blueprint.
-Use ONLY the supplied PDF context as the source of syllabus facts.
-Do not invent topics, formulas, rules, or syllabus claims.
+Topic:
+{topic or "Relevant material from the uploaded book"}
 
-Return valid JSON with:
-{
-  "subject": "...",
-  "topic": "...",
-  "difficulty": "...",
-  "question_count": 20,
-  "blueprint": [
-    {
-      "concept": "...",
-      "question_type": "conceptual|numerical",
-      "difficulty": "...",
-      "focus": "..."
-    }
+Difficulty:
+{difficulty}
+
+Rules:
+- Use only the supplied book content.
+- Exactly four options: A, B, C, D.
+- Exactly one correct answer.
+- Include conceptual and numerical questions when supported by the source.
+- Numerical answers must be calculated carefully.
+- Provide a short explanation.
+- Questions must be suitable for ECAT preparation.
+
+Return JSON:
+{{
+  "questions": [
+    {{
+      "question": "question text",
+      "A": "option A",
+      "B": "option B",
+      "C": "option C",
+      "D": "option D",
+      "answer": "A",
+      "explanation": "clear explanation"
+    }}
   ]
-}
+}}
+
+BOOK CONTENT:
+{context_text(context)}
 """
+    data = ask_groq(prompt)
+    return data.get("questions", [])
 
-    user_prompt = f"""
-Subject: {subject}
-Requested topic: {topic}
-Difficulty: {difficulty}
-Number of questions: {number_of_questions}
 
-Retrieved PDF context:
-{retrieved_context}
+def generate_quiz(context: List[Dict[str, Any]], topic: str, difficulty: str):
+    prompt = f"""
+Create exactly 10 ECAT practice quiz questions from the supplied book content.
+
+Topic:
+{topic or "Relevant material from the uploaded book"}
+
+Difficulty:
+{difficulty}
+
+Rules:
+- Use only the supplied book content.
+- Four options A, B, C, D.
+- Exactly one correct answer.
+- Mix conceptual and numerical questions when possible.
+- Verify numerical calculations.
+- Do not reveal the answer in the question.
+
+Return JSON:
+{{
+  "questions": [
+    {{
+      "question": "question text",
+      "A": "option A",
+      "B": "option B",
+      "C": "option C",
+      "D": "option D",
+      "answer": "A",
+      "explanation": "explanation shown after submission"
+    }}
+  ]
+}}
+
+BOOK CONTENT:
+{context_text(context)}
 """
-
-    raw = groq_generate(system_prompt, user_prompt, model=model, temperature=0.1)
-
-    try:
-        return json.loads(extract_json(raw))
-    except Exception:
-        return {
-            "subject": subject,
-            "topic": topic,
-            "difficulty": difficulty,
-            "question_count": number_of_questions,
-            "blueprint": [
-                {
-                    "concept": topic,
-                    "question_type": "mixed",
-                    "difficulty": difficulty,
-                    "focus": "Use the retrieved PDF content only.",
-                }
-            ],
-        }
+    data = ask_groq(prompt)
+    return data.get("questions", [])
 
 
-# -----------------------------
-# Agent B: MCQ Generator
-# -----------------------------
-def generator_agent(
-    blueprint: Dict[str, Any],
-    retrieved_context: str,
-    model: str,
-) -> List[Dict[str, Any]]:
-    """Generate MCQs grounded in the retrieved PDF context."""
-    system_prompt = """
-You are Agent B, an expert ECAT MCQ author.
+def render_questions(questions: List[Dict[str, Any]], quiz_mode: bool):
+    if not questions:
+        st.warning("No questions were generated. Try another topic.")
+        return
 
-Generate original ECAT-style multiple-choice questions using ONLY the
-retrieved study material and blueprint.
+    if quiz_mode:
+        st.markdown("### 🎯 ECAT Quiz")
 
-Important:
-- Do not copy a question verbatim from the PDF.
-- Do not invent information outside the retrieved context.
-- Create four options A, B, C, D.
-- Make distractors plausible and based on common student mistakes.
-- Do not reveal the correct answer to Agent C in a separate field.
-- For numerical questions, include all necessary values in the question.
-- Keep mathematical notation readable in plain text.
+        with st.form("ecat_quiz_form"):
+            answers = {}
 
-Return ONLY a JSON array:
-[
-  {
-    "id": 1,
-    "question": "...",
-    "options": {
-      "A": "...",
-      "B": "...",
-      "C": "...",
-      "D": "..."
-    },
-    "concept": "...",
-    "difficulty": "..."
-  }
-]
-"""
+            for i, question in enumerate(questions):
+                st.markdown(f"#### Q{i + 1}. {question.get('question', '')}")
 
-    user_prompt = f"""
-Blueprint:
-{json.dumps(blueprint, indent=2)}
+                answers[i] = st.radio(
+                    "Select your answer",
+                    ["A", "B", "C", "D"],
+                    format_func=lambda x, q=question: f"{x}. {q.get(x, '')}",
+                    key=f"quiz_answer_{i}",
+                )
 
-Retrieved source context:
-{retrieved_context}
-"""
-
-    raw = groq_generate(system_prompt, user_prompt, model=model, temperature=0.45)
-    parsed = json.loads(extract_json(raw))
-
-    if isinstance(parsed, dict) and "questions" in parsed:
-        parsed = parsed["questions"]
-
-    return parsed
-
-
-# -----------------------------
-# Agent C: Independent verifier
-# -----------------------------
-def safe_math_eval(expression: str):
-    """
-    Evaluate a restricted mathematical expression using Python.
-
-    This is intentionally limited to arithmetic and selected math functions.
-    It is not a general Python execution environment.
-    """
-    allowed = {
-        "sqrt": math.sqrt,
-        "sin": math.sin,
-        "cos": math.cos,
-        "tan": math.tan,
-        "pi": math.pi,
-        "log": math.log,
-        "exp": math.exp,
-        "abs": abs,
-        "pow": pow,
-    }
-
-    cleaned = expression.strip()
-    cleaned = cleaned.replace("^", "**")
-
-    if not re.fullmatch(r"[0-9a-zA-Z_+\-*/().,%\s*]+", cleaned):
-        raise ValueError("Expression contains unsupported characters.")
-
-    return eval(cleaned, {"__builtins__": {}}, allowed)
-
-
-def verifier_agent(
-    questions: List[Dict[str, Any]],
-    retrieved_context: str,
-    model: str,
-) -> List[Dict[str, Any]]:
-    """
-    Independently solve each MCQ without trusting a generated answer key.
-
-    The LLM verifier determines the reasoning and identifies the likely
-    correct option. A deterministic Python calculator is used when the
-    verifier supplies a simple arithmetic expression.
-    """
-    verified_questions = []
-
-    system_prompt = """
-You are Agent C, an independent ECAT quality-control verifier.
-
-You must solve each question independently.
-You have NOT been given an answer key.
-
-For every question:
-1. Determine the correct option.
-2. Check the calculation carefully.
-3. Identify ambiguity, missing information, or unsupported claims.
-4. Provide a concise step-by-step explanation.
-5. State PASS only when the question and answer are defensible from the source context.
-
-Return ONLY JSON:
-{
-  "correct_option": "A|B|C|D",
-  "verification_status": "PASS|FAIL",
-  "reason": "...",
-  "explanation": "...",
-  "calculation_expression": null
-}
-
-If a simple numerical calculation can be represented as a safe arithmetic
-expression, put that expression in calculation_expression. Otherwise use null.
-"""
-
-    for question in questions:
-        user_prompt = f"""
-Question:
-{question.get("question", "")}
-
-Options:
-{json.dumps(question.get("options", {}), indent=2)}
-
-Concept:
-{question.get("concept", "")}
-
-Relevant source context:
-{retrieved_context}
-"""
-
-        try:
-            raw = groq_generate(
-                system_prompt,
-                user_prompt,
-                model=model,
-                temperature=0.05,
+            submitted = st.form_submit_button(
+                "Submit Quiz",
+                type="primary",
+                use_container_width=True,
             )
-            result = json.loads(extract_json(raw))
-        except Exception as exc:
-            result = {
-                "correct_option": "UNKNOWN",
-                "verification_status": "FAIL",
-                "reason": f"Verifier error: {exc}",
-                "explanation": "The question could not be independently verified.",
-                "calculation_expression": None,
-            }
 
-        expression = result.get("calculation_expression")
+        if submitted:
+            score = 0
 
-        if expression:
-            try:
-                value = safe_math_eval(expression)
-                result["calculator_check"] = {
-                    "expression": expression,
-                    "result": value,
-                    "status": "PASS",
-                }
-            except Exception as exc:
-                result["calculator_check"] = {
-                    "expression": expression,
-                    "result": None,
-                    "status": "NOT_EXECUTED",
-                    "reason": str(exc),
-                }
-        else:
-            result["calculator_check"] = {
-                "expression": None,
-                "result": None,
-                "status": "NOT_REQUIRED",
-            }
+            for i, question in enumerate(questions):
+                correct = str(question.get("answer", "")).upper()
 
-        verified_questions.append(
-            {
-                **question,
-                "verification": result,
-            }
-        )
+                if answers.get(i) == correct:
+                    score += 1
 
-    return verified_questions
+            percentage = round((score / len(questions)) * 100)
 
+            st.divider()
+            st.subheader("📊 Quiz Result")
+            st.metric(
+                "Score",
+                f"{score} / {len(questions)}",
+            )
+            st.progress(percentage / 100)
+            st.write(f"Accuracy: **{percentage}%**")
 
-# -----------------------------
-# Agent D: Curator/Explainer
-# -----------------------------
-def curator_agent(
-    verified_questions: List[Dict[str, Any]],
-    model: str,
-) -> List[Dict[str, Any]]:
-    """Create polished pedagogical explanations for verified questions."""
-    system_prompt = """
-You are Agent D, the ECAT Curator and Explainer.
+            if percentage >= 80:
+                st.success("Excellent performance! Keep practicing.")
+            elif percentage >= 60:
+                st.info("Good attempt. Revise the weaker concepts.")
+            else:
+                st.warning("Revise the topic and try the quiz again.")
 
-Only process questions that have passed verification.
-Improve the explanation for students without changing the verified answer.
+            st.markdown("### Answer Review")
 
-Return ONLY JSON array:
-[
-  {
-    "id": 1,
-    "correct_option": "A",
-    "explanation": "Step-by-step explanation..."
-  }
-]
-"""
+            for i, question in enumerate(questions):
+                correct = str(question.get("answer", "")).upper()
+                selected = answers.get(i)
 
-    passed = [
-        q
-        for q in verified_questions
-        if q.get("verification", {}).get("verification_status") == "PASS"
-    ]
+                if selected == correct:
+                    st.success(f"Q{i + 1}: Correct")
+                else:
+                    st.error(
+                        f"Q{i + 1}: Your answer: {selected} | "
+                        f"Correct answer: {correct}"
+                    )
 
-    if not passed:
-        return []
+                st.caption(question.get("explanation", ""))
 
-    user_prompt = json.dumps(
-        [
-            {
-                "id": q.get("id"),
-                "question": q.get("question"),
-                "options": q.get("options"),
-                "verified_answer": q.get("verification", {}).get("correct_option"),
-                "verification_reason": q.get("verification", {}).get("reason"),
-            }
-            for q in passed
-        ],
-        indent=2,
-    )
+    else:
+        st.markdown("### 🧠 Generated MCQs")
 
-    raw = groq_generate(system_prompt, user_prompt, model=model, temperature=0.15)
+        for i, question in enumerate(questions):
+            st.markdown(
+                f"#### Q{i + 1}. {question.get('question', '')}"
+            )
 
-    try:
-        result = json.loads(extract_json(raw))
-        return result if isinstance(result, list) else result.get("questions", [])
-    except Exception:
-        return []
+            st.markdown(f"**A.** {question.get('A', '')}")
+            st.markdown(f"**B.** {question.get('B', '')}")
+            st.markdown(f"**C.** {question.get('C', '')}")
+            st.markdown(f"**D.** {question.get('D', '')}")
+
+            with st.expander("Show answer & explanation"):
+                st.success(
+                    f"Correct Answer: {question.get('answer', '')}"
+                )
+                st.write(question.get("explanation", ""))
 
 
 # -----------------------------
-# JSON helper
+# Session state
 # -----------------------------
-def extract_json(text: str) -> str:
-    """Extract a JSON object or array from an LLM response."""
-    text = text.strip()
+if "book_ready" not in st.session_state:
+    st.session_state.book_ready = False
 
-    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
 
-    array_start = text.find("[")
-    object_start = text.find("{")
+if "index" not in st.session_state:
+    st.session_state.index = None
 
-    starts = [x for x in [array_start, object_start] if x >= 0]
+if "source_name" not in st.session_state:
+    st.session_state.source_name = ""
 
-    if not starts:
-        raise ValueError("No JSON object or array found.")
+if "summary" not in st.session_state:
+    st.session_state.summary = None
 
-    start = min(starts)
+if "notes" not in st.session_state:
+    st.session_state.notes = None
 
-    array_end = text.rfind("]")
-    object_end = text.rfind("}")
+if "mcqs" not in st.session_state:
+    st.session_state.mcqs = []
 
-    end = max(array_end, object_end)
-
-    if end < start:
-        raise ValueError("Incomplete JSON response.")
-
-    return text[start:end + 1]
+if "quiz" not in st.session_state:
+    st.session_state.quiz = []
 
 
 # -----------------------------
-# Quiz scoring
+# Main user interface
 # -----------------------------
-def score_quiz(questions: List[Dict[str, Any]], answers: Dict[int, str]):
-    """Calculate quiz score against independently verified answers."""
-    correct = 0
-
-    for q in questions:
-        qid = q.get("id")
-        expected = q.get("verification", {}).get("correct_option")
-        selected = answers.get(qid)
-
-        if selected and expected and selected == expected:
-            correct += 1
-
-    total = len(questions)
-    percentage = round((correct / total) * 100, 2) if total else 0
-
-    return correct, total, percentage
-
-
-# -----------------------------
-# Sidebar
-# -----------------------------
-with st.sidebar:
-    st.header("⚙️ ECAT-Tutor-AI")
-
-    groq_model = st.selectbox(
-        "Groq model",
-        [
-            "llama-3.3-70b-versatile",
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-        ],
-        index=0,
-    )
-
-    top_k = st.slider(
-        "RAG chunks to retrieve",
-        min_value=2,
-        max_value=10,
-        value=6,
-    )
-
-    chunk_size = st.slider(
-        "Chunk size (tokens)",
-        min_value=150,
-        max_value=600,
-        value=300,
-        step=50,
-    )
-
-    st.divider()
-
-    st.markdown("### Pipeline")
-    st.write("📄 PDF ingestion")
-    st.write("✂️ Token-aware chunking")
-    st.write("🔤 Tokenization")
-    st.write("🧠 Embeddings")
-    st.write("🔎 FAISS retrieval")
-    st.write("🤖 Groq agents")
-    st.write("🧮 Deterministic verification")
-    st.write("✅ Certified questions")
-
-
-# -----------------------------
-# Main UI
-# -----------------------------
-st.markdown(
-    '<div class="main-title">🎓 ECAT-Tutor-AI</div>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<div class="subtitle">RAG-Based ECAT Mock Test Generator & Quality-Control Auditor</div>',
-    unsafe_allow_html=True,
-)
-
-st.info(
-    "Upload an ECAT PDF. The system extracts its content, chunks and tokenizes it, "
-    "creates embeddings, stores them in FAISS, retrieves relevant context, and "
-    "generates verified MCQs grounded in that PDF."
-)
+st.markdown("## 📚 Upload Your ECAT Book")
 
 uploaded_file = st.file_uploader(
-    "📚 Upload ECAT study material / syllabus PDF",
+    "Choose your ECAT book in PDF format",
     type=["pdf"],
-    help="Upload an ECAT preparation PDF, syllabus, notes, or chapter material.",
-)
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    subject = st.selectbox(
-        "Subject",
-        ["Physics", "Mathematics", "Chemistry", "Mixed ECAT"],
-    )
-
-with col2:
-    topic = st.text_input(
-        "Topic",
-        placeholder="e.g. Calculus, Rotational Motion, Vectors",
-    )
-
-with col3:
-    difficulty = st.selectbox(
-        "Difficulty",
-        ["Easy", "Medium", "Hard", "ECAT Challenge"],
-        index=1,
-    )
-
-number_of_questions = st.slider(
-    "Number of MCQs",
-    min_value=5,
-    max_value=20,
-    value=10,
+    help="Upload a text-based PDF. Scanned image-only PDFs require OCR.",
 )
 
 if uploaded_file:
-    if st.button("🔍 Process PDF & Build RAG Database", use_container_width=True):
-        with st.spinner("Extracting PDF text..."):
-            raw_text = extract_pdf_text(uploaded_file)
-            raw_text = normalize_text(raw_text)
-
-        if len(raw_text) < 100:
-            st.error(
-                "Very little text was extracted. If your PDF is scanned images, "
-                "OCR support is required before it can be retrieved."
-            )
-        else:
-            with st.spinner("Tokenizing and chunking the PDF..."):
-                token_ids = tokenize_text(raw_text)
-                chunks = chunk_text(
-                    raw_text,
-                    max_tokens=chunk_size,
-                    overlap=max(30, chunk_size // 5),
-                )
-
-            with st.spinner("Creating embeddings and FAISS vector database..."):
-                index, embeddings = build_faiss_index(chunks)
-
-            st.session_state["raw_text"] = raw_text
-            st.session_state["chunks"] = chunks
-            st.session_state["faiss_index"] = index
-            st.session_state["embeddings"] = embeddings
-            st.session_state["token_count"] = len(token_ids)
-            st.session_state["source_name"] = uploaded_file.name
-
-            st.success(
-                f"RAG database ready: {len(chunks)} chunks, "
-                f"{len(token_ids):,} source tokens, "
-                f"{embeddings.shape[1]}-dimension embeddings."
-            )
-
-if "faiss_index" in st.session_state:
-    st.divider()
-
-    rag_col1, rag_col2, rag_col3 = st.columns(3)
-
-    with rag_col1:
-        st.metric("PDF Chunks", len(st.session_state["chunks"]))
-
-    with rag_col2:
-        st.metric("Tokens", f"{st.session_state['token_count']:,}")
-
-    with rag_col3:
-        st.metric(
-            "Embedding Dimension",
-            st.session_state["embeddings"].shape[1],
-        )
-
     if st.button(
-        "🚀 Generate Verified ECAT Mock Test",
+        "🚀 Process My Book",
         type="primary",
         use_container_width=True,
     ):
-        if not topic.strip():
-            st.warning(
-                "Enter a topic so the RAG retriever can focus on the requested ECAT concept."
-            )
-            st.stop()
-
         try:
-            with st.status(
-                "Running ECAT-Tutor-AI agent pipeline...",
-                expanded=True,
-            ) as status:
+            with st.spinner("Preparing your book..."):
+                pages = extract_pdf_pages(uploaded_file)
 
-                st.write("🔎 Retrieving relevant PDF context...")
-                retrieved = retrieve_context(
-                    query=f"{subject} {topic} {difficulty} ECAT",
-                    chunks=st.session_state["chunks"],
-                    index=st.session_state["faiss_index"],
-                    top_k=top_k,
-                )
+                if not pages:
+                    st.error(
+                        "No selectable text was found in this PDF. "
+                        "Please use a text-based PDF or add OCR support."
+                    )
+                    st.stop()
 
-                context_text = "\n\n--- SOURCE CHUNK ---\n\n".join(
-                    [
-                        f"[Chunk {r['chunk_id']} | similarity={r['score']:.3f}]\n{r['chunk']}"
-                        for r in retrieved
-                    ]
-                )
+                chunks = create_chunks(pages)
+                index = create_vector_index(chunks)
 
-                st.write("🧠 Agent A: Building syllabus/question blueprint...")
-                blueprint = architect_agent(
-                    subject=subject,
-                    topic=topic,
-                    difficulty=difficulty,
-                    number_of_questions=number_of_questions,
-                    retrieved_context=context_text,
-                    model=groq_model,
-                )
+                st.session_state.book_ready = True
+                st.session_state.chunks = chunks
+                st.session_state.index = index
+                st.session_state.source_name = uploaded_file.name
 
-                st.write("✍️ Agent B: Generating original ECAT MCQs...")
-                questions = generator_agent(
-                    blueprint=blueprint,
-                    retrieved_context=context_text,
-                    model=groq_model,
-                )
+                st.session_state.summary = None
+                st.session_state.notes = None
+                st.session_state.mcqs = []
+                st.session_state.quiz = []
 
-                questions = questions[:number_of_questions]
-
-                st.write("🧮 Agent C: Independently solving and verifying MCQs...")
-                verified_questions = verifier_agent(
-                    questions=questions,
-                    retrieved_context=context_text,
-                    model=groq_model,
-                )
-
-                st.write("📘 Agent D: Creating student-friendly explanations...")
-                explanations = curator_agent(
-                    verified_questions=verified_questions,
-                    model=groq_model,
-                )
-
-                explanation_map = {
-                    item.get("id"): item
-                    for item in explanations
-                }
-
-                for q in verified_questions:
-                    exp = explanation_map.get(q.get("id"))
-                    if exp:
-                        q["curated_explanation"] = exp.get("explanation", "")
-
-                passed_questions = [
-                    q
-                    for q in verified_questions
-                    if q.get("verification", {}).get("verification_status") == "PASS"
-                ]
-
-                st.session_state["exam_questions"] = passed_questions
-                st.session_state["retrieved_context"] = retrieved
-                st.session_state["blueprint"] = blueprint
-
-                status.update(
-                    label=(
-                        f"Pipeline complete — {len(passed_questions)} verified "
-                        f"questions generated."
-                    ),
-                    state="complete",
-                )
+            st.success("Your ECAT book is ready! 🎉")
 
         except Exception as exc:
-            st.error(f"Generation failed: {exc}")
+            st.error(f"Book processing failed: {exc}")
 
-# -----------------------------
-# Display retrieved context
-# -----------------------------
-if st.session_state.get("retrieved_context"):
-    with st.expander("🔎 View RAG Retrieved Context"):
-        for item in st.session_state["retrieved_context"]:
-            st.markdown(
-                f"**Chunk {item['chunk_id']} — similarity {item['score']:.3f}**"
-            )
-            st.write(item["chunk"])
 
-# -----------------------------
-# Display exam
-# -----------------------------
-questions = st.session_state.get("exam_questions", [])
-
-if questions:
+if st.session_state.book_ready:
     st.divider()
-    st.header("📝 Verified ECAT Mock Test")
 
-    st.caption(
-        f"Source: {st.session_state.get('source_name', 'Uploaded PDF')} | "
-        f"Verified questions: {len(questions)}"
+    st.success(
+        f"📖 Book loaded: {st.session_state.source_name}"
     )
 
-    answers = {}
+    col1, col2 = st.columns(2)
 
-    for position, q in enumerate(questions, start=1):
-        qid = q.get("id", position)
-
-        st.subheader(
-            f"Q{position}. {q.get('question', '')}"
+    with col1:
+        subject = st.selectbox(
+            "Subject",
+            ["Physics", "Mathematics", "Chemistry", "Mixed ECAT"],
         )
 
-        options = q.get("options", {})
-
-        selected = st.radio(
-            "Choose an answer:",
-            options=["Select an option"] + list(options.keys()),
-            format_func=lambda key: (
-                "Select an option"
-                if key == "Select an option"
-                else f"{key}) {options.get(key, '')}"
-            ),
-            key=f"answer_{qid}",
+    with col2:
+        difficulty = st.selectbox(
+            "MCQ / Quiz Difficulty",
+            ["Easy", "Medium", "Hard", "ECAT Challenge"],
+            index=1,
         )
 
-        if selected != "Select an option":
-            answers[qid] = selected
-
-        st.markdown(
-            f"**Concept:** {q.get('concept', 'Not specified')}  \n"
-            f"**Difficulty:** {q.get('difficulty', difficulty)}"
-        )
-
-        verification = q.get("verification", {})
-        st.markdown(
-            '<span class="verified">✓ Independently Verified</span>',
-            unsafe_allow_html=True,
-        )
-
-        with st.expander("View explanation"):
-            st.write(
-                q.get("curated_explanation")
-                or verification.get("explanation", "No explanation available.")
-            )
-
-        with st.expander("View quality-control details"):
-            st.write(
-                f"**Verified answer:** "
-                f"{verification.get('correct_option', 'Unknown')}"
-            )
-            st.write(
-                f"**Verification status:** "
-                f"{verification.get('verification_status', 'Unknown')}"
-            )
-            st.write(
-                f"**Verifier reason:** "
-                f"{verification.get('reason', '')}"
-            )
-
-            calculator_check = verification.get("calculator_check", {})
-            if calculator_check.get("expression"):
-                st.write(
-                    f"**Calculator expression:** "
-                    f"`{calculator_check.get('expression')}`"
-                )
-                st.write(
-                    f"**Calculator result:** "
-                    f"{calculator_check.get('result')}"
-                )
-                st.write(
-                    f"**Calculator status:** "
-                    f"{calculator_check.get('status')}"
-                )
-
-        st.divider()
-
-    if st.button("📊 Submit Quiz", type="primary"):
-        correct, total, percentage = score_quiz(questions, answers)
-
-        st.success(
-            f"Score: {correct}/{total} — {percentage}%"
-        )
-
-        if percentage >= 80:
-            st.balloons()
-            st.write("Excellent ECAT preparation performance!")
-        elif percentage >= 60:
-            st.write("Good attempt. Review the explanations for improvement.")
-        else:
-            st.write("Keep practicing and review the verified explanations.")
-
-    exam_text = "# ECAT-Tutor-AI — Verified Mock Test\n\n"
-
-    for position, q in enumerate(questions, start=1):
-        exam_text += f"## Q{position}. {q.get('question', '')}\n\n"
-
-        for key, value in q.get("options", {}).items():
-            exam_text += f"- {key}) {value}\n"
-
-        verification = q.get("verification", {})
-        exam_text += (
-            f"\n**Verified Answer:** "
-            f"{verification.get('correct_option', 'Unknown')}\n\n"
-        )
-        exam_text += (
-            f"**Explanation:** "
-            f"{q.get('curated_explanation') or verification.get('explanation', '')}\n\n"
-        )
-
-    st.download_button(
-        "⬇️ Download Verified Mock Test",
-        data=exam_text,
-        file_name="ecat_verified_mock_test.md",
-        mime="text/markdown",
-        use_container_width=True,
-    )
-else:
-    st.markdown(
-        """
-        ### How it works
-
-        1. Upload an ECAT PDF.
-        2. The PDF is converted into text.
-        3. Text is tokenized and split into overlapping chunks.
-        4. Chunks are converted into embedding vectors.
-        5. FAISS stores and searches the vectors.
-        6. Relevant PDF content is retrieved for the selected topic.
-        7. Agent A creates the question blueprint.
-        8. Agent B generates original MCQs and distractors.
-        9. Agent C independently verifies each question.
-        10. Agent D produces student-friendly explanations.
-        11. Only passed questions are shown as the verified quiz.
-        """
+    topic = st.text_input(
+        "Chapter or topic (optional)",
+        placeholder="Example: Rotational Motion",
     )
 
-st.caption(
-    "ECAT-Tutor-AI | RAG + FAISS + Sentence Transformers + Groq + Streamlit"
-)
+    st.markdown("### What do you want to generate?")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        summary_button = st.button(
+            "📝 Summary",
+            use_container_width=True,
+        )
+
+    with c2:
+        notes_button = st.button(
+            "📌 Study Notes",
+            use_container_width=True,
+        )
+
+    with c3:
+        mcq_button = st.button(
+            "🧠 MCQs",
+            use_container_width=True,
+        )
+
+    with c4:
+        quiz_button = st.button(
+            "🎯 Start Quiz",
+            use_container_width=True,
+        )
+
+    query = f"{subject}. {topic}" if topic else subject
+
+    if summary_button:
+        try:
+            with st.spinner("Creating your summary..."):
+                context = retrieve_relevant_chunks(
+                    query,
+                    st.session_state.chunks,
+                    st.session_state.index,
+                )
+
+                st.session_state.summary = generate_summary(
+                    context,
+                    topic,
+                )
+
+            st.success("Summary generated.")
+
+        except Exception as exc:
+            st.error(f"Summary generation failed: {exc}")
+
+    if notes_button:
+        try:
+            with st.spinner("Creating your study notes..."):
+                context = retrieve_relevant_chunks(
+                    query,
+                    st.session_state.chunks,
+                    st.session_state.index,
+                )
+
+                st.session_state.notes = generate_notes(
+                    context,
+                    topic,
+                )
+
+            st.success("Study notes generated.")
+
+        except Exception as exc:
+            st.error(f"Notes generation failed: {exc}")
+
+    if mcq_button:
+        try:
+            with st.spinner("Creating ECAT MCQs..."):
+                context = retrieve_relevant_chunks(
+                    query,
+                    st.session_state.chunks,
+                    st.session_state.index,
+                )
+
+                st.session_state.mcqs = generate_mcqs(
+                    context,
+                    topic,
+                    difficulty,
+                    10,
+                )
+
+            st.success("MCQs generated.")
+
+        except Exception as exc:
+            st.error(f"MCQ generation failed: {exc}")
+
+    if quiz_button:
+        try:
+            with st.spinner("Preparing your ECAT quiz..."):
+                context = retrieve_relevant_chunks(
+                    query,
+                    st.session_state.chunks,
+                    st.session_state.index,
+                )
+
+                st.session_state.quiz = generate_quiz(
+                    context,
+                    topic,
+                    difficulty,
+                )
+
+            st.success("Quiz is ready.")
+
+        except Exception as exc:
+            st.error(f"Quiz generation failed: {exc}")
+
+
+# -----------------------------
+# Generated content
+# -----------------------------
+if st.session_state.summary:
+    st.divider()
+    st.subheader("📝 AI Summary")
+
+    summary = st.session_state.summary
+
+    st.markdown(f"### {summary.get('title', 'ECAT Summary')}")
+    st.write(summary.get("summary", ""))
+
+    with st.expander("📌 Key Points", expanded=True):
+        for item in summary.get("key_points", []):
+            st.markdown(f"- {item}")
+
+    with st.expander("📐 Important Formulas"):
+        for item in summary.get("formulas", []):
+            st.markdown(f"- {item}")
+
+    with st.expander("⚡ Quick Revision"):
+        for item in summary.get("quick_revision", []):
+            st.markdown(f"- {item}")
+
+
+if st.session_state.notes:
+    st.divider()
+    st.subheader("📚 Study Notes")
+
+    notes = st.session_state.notes
+
+    st.markdown(f"### {notes.get('title', 'ECAT Study Notes')}")
+
+    with st.expander("Concepts", expanded=True):
+        for item in notes.get("concepts", []):
+            st.markdown(f"- {item}")
+
+    with st.expander("Definitions"):
+        for item in notes.get("definitions", []):
+            st.markdown(f"- {item}")
+
+    with st.expander("Formulas"):
+        for item in notes.get("formulas", []):
+            st.markdown(f"- {item}")
+
+    with st.expander("Important Points"):
+        for item in notes.get("important_points", []):
+            st.markdown(f"- {item}")
+
+    with st.expander("Exam Tips"):
+        for item in notes.get("exam_tips", []):
+            st.markdown(f"- {item}")
+
+
+if st.session_state.mcqs:
+    st.divider()
+    render_questions(
+        st.session_state.mcqs,
+        quiz_mode=False,
+    )
+
+
+if st.session_state.quiz:
+    st.divider()
+    render_questions(
+        st.session_state.quiz,
+        quiz_mode=True,
+    )
